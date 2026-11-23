@@ -1,0 +1,102 @@
+name: check
+
+# Builds a Dalamud plugin the same way the release workflow does and confirms the packaged
+# manifest carries what the publish API requires, so a release does not fail on a 400.
+
+on:
+  workflow_call:
+    inputs:
+      plugin-name:
+        description: The plugin's InternalName. The packaged <plugin-name>.json is looked up by it.
+        required: true
+        type: string
+      build-target:
+        description: The solution or project to build. Empty builds the repository root.
+        required: false
+        type: string
+        default: ""
+      artifact-dir:
+        description: The directory holding the packaged zip and manifest. Empty finds it.
+        required: false
+        type: string
+        default: ""
+      dalamud-zip-url:
+        description: The Dalamud build to compile against.
+        required: false
+        type: string
+        default: https://goatcorp.github.io/dalamud-distrib/latest.zip
+      dotnet-version:
+        required: false
+        type: string
+        default: 10.0.x
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PLUGIN: ${{ inputs.plugin-name }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Download Dalamud
+        env:
+          DALAMUD_ZIP_URL: ${{ inputs.dalamud-zip-url }}
+        run: |
+          Invoke-WebRequest -Uri $env:DALAMUD_ZIP_URL -OutFile dalamud.zip
+          Expand-Archive -Force dalamud.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ inputs.build-target }}
+        run: dotnet build $BUILD_TARGET -c Release
+
+      - id: artifact
+        name: Inspect the packaged manifest
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ inputs.artifact-dir }}
+        run: |
+          set -euo pipefail
+          dir="$ARTIFACT_DIR"
+          if [ -z "$dir" ]; then
+            while IFS= read -r manifest; do
+              candidate=$(dirname "$manifest")
+              if compgen -G "$candidate/*.zip" > /dev/null; then
+                dir="$candidate"
+                break
+              fi
+            done < <(find . -type f -name "$PLUGIN.json" -not -path '*/obj/*' -not -path './.git/*')
+          fi
+          test -n "$dir" || { echo "::error::no $PLUGIN.json with a zip beside it was found"; exit 1; }
+
+          shopt -s nullglob
+          zips=("$dir"/*.zip)
+          test ${#zips[@]} -eq 1 || { echo "::error::expected one zip in $dir, found ${#zips[@]}"; exit 1; }
+
+          manifest="$dir/$PLUGIN.json"
+          echo "artifact: ${zips[0]}"
+          ls -l "${zips[0]}"
+          cat "$manifest"
+          echo
+
+          for key in InternalName AssemblyVersion DalamudApiLevel; do
+            value=$(sed '1s/^\xEF\xBB\xBF//' "$manifest" | jq -r --arg key "$key" '.[$key] // empty')
+            test -n "$value" || { echo "::error::the manifest has no $key"; exit 1; }
+          done
+          echo "required fields: ok"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plugin-name }}
+          path: ${{ steps.artifact.outputs.dir }}/*
+          if-no-files-found: error
+          retention-days: 3

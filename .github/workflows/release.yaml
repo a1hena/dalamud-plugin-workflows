@@ -1,0 +1,241 @@
+name: release
+
+# Builds a Dalamud plugin, registers it with dalamud-plugin-server, puts it on the testing
+# channel of every endpoint delivering it, and then tags the commit and creates a GitHub Release.
+#
+# The version comes from the conventional commits since the latest tag. A push with nothing worth
+# a release (docs:, ci:, chore: ...) ends after the version step.
+#
+# Stable is never touched here. It is promoted by hand in the admin console.
+
+on:
+  workflow_call:
+    inputs:
+      plugin-name:
+        description: The plugin's InternalName. The packaged <plugin-name>.json is looked up by it.
+        required: true
+        type: string
+      build-target:
+        description: The solution or project to build. Empty builds the repository root.
+        required: false
+        type: string
+        default: ""
+      artifact-dir:
+        description: The directory holding the packaged zip and manifest. Empty finds it.
+        required: false
+        type: string
+        default: ""
+      server-url:
+        description: The dalamud-plugin-server instance to publish to.
+        required: false
+        type: string
+        default: https://dalamud-plugins.hyuma.dev
+      testing:
+        description: Whether to put the new version on testing for every delivering endpoint.
+        required: false
+        type: boolean
+        default: true
+      dalamud-zip-url:
+        description: The Dalamud build to compile against.
+        required: false
+        type: string
+        default: https://goatcorp.github.io/dalamud-distrib/latest.zip
+      dotnet-version:
+        required: false
+        type: string
+        default: 10.0.x
+    secrets:
+      PLUGIN_SERVER_API_KEY:
+        description: A publish API key. Testing needs the Change channels permission as well.
+        required: true
+    outputs:
+      version:
+        description: The released version, empty when nothing was released.
+        value: ${{ jobs.release.outputs.version }}
+
+jobs:
+  release:
+    # The Dalamud references assume %AppData%, so the build runs on Windows.
+    runs-on: windows-latest
+    # Deciding the version, publishing and tagging happen in one job under one lock, so two runs
+    # can never pick the same version.
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.resolve.outputs.new_version }}
+    env:
+      PLUGIN: ${{ inputs.plugin-name }}
+      SERVER: ${{ inputs.server-url }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # Only calculates. The tag is created by the release at the end, once publishing succeeded,
+      # so a failed run can simply be re-run.
+      - id: resolve
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: v
+          default_bump: false
+          dry_run: true
+
+      - name: Nothing to release
+        if: steps.resolve.outputs.new_version == ''
+        shell: bash
+        run: echo "No commit since the latest tag asks for a release."
+
+      - uses: actions/setup-dotnet@v5
+        if: steps.resolve.outputs.new_version != ''
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Download Dalamud
+        if: steps.resolve.outputs.new_version != ''
+        env:
+          DALAMUD_ZIP_URL: ${{ inputs.dalamud-zip-url }}
+        run: |
+          Invoke-WebRequest -Uri $env:DALAMUD_ZIP_URL -OutFile dalamud.zip
+          Expand-Archive -Force dalamud.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
+
+      # The csproj <Version> is left alone and the version is injected here. Dalamud needs a
+      # four part AssemblyVersion.
+      - name: Build
+        if: steps.resolve.outputs.new_version != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.new_version }}
+          BUILD_TARGET: ${{ inputs.build-target }}
+        run: dotnet build $BUILD_TARGET -c Release -p:Version="$VERSION.0"
+
+      - id: artifact
+        name: Locate the packaged plugin
+        if: steps.resolve.outputs.new_version != ''
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ inputs.artifact-dir }}
+        run: |
+          set -euo pipefail
+          dir="$ARTIFACT_DIR"
+          if [ -z "$dir" ]; then
+            # The packager writes <InternalName>.json next to the zip. The project's own
+            # <InternalName>.json has no zip beside it, so it is passed over.
+            while IFS= read -r manifest; do
+              candidate=$(dirname "$manifest")
+              if compgen -G "$candidate/*.zip" > /dev/null; then
+                dir="$candidate"
+                break
+              fi
+            done < <(find . -type f -name "$PLUGIN.json" -not -path '*/obj/*' -not -path './.git/*')
+          fi
+          test -n "$dir" || { echo "::error::no $PLUGIN.json with a zip beside it was found"; exit 1; }
+
+          shopt -s nullglob
+          zips=("$dir"/*.zip)
+          test ${#zips[@]} -eq 1 || { echo "::error::expected one zip in $dir, found ${#zips[@]}"; exit 1; }
+
+          manifest="$dir/$PLUGIN.json"
+          test -f "$manifest" || { echo "::error::$manifest is missing"; exit 1; }
+          echo "zip=${zips[0]}" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "zip: ${zips[0]}"
+          cat "$manifest"
+
+      # The artifact goes straight to R2 and never through the Worker. Phase one returns where to
+      # put it and a presigned URL, phase two uploads, phase three registers the version.
+      - id: publish
+        name: Publish to plugin server
+        if: steps.resolve.outputs.new_version != ''
+        shell: bash
+        env:
+          API_KEY: ${{ secrets.PLUGIN_SERVER_API_KEY }}
+          ZIP: ${{ steps.artifact.outputs.zip }}
+          MANIFEST: ${{ steps.artifact.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          size=$(stat -c%s "$ZIP")
+          sha256=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          md5=$(md5sum "$ZIP" | cut -d' ' -f1)
+          manifest_json=$(sed '1s/^\xEF\xBB\xBF//' "$MANIFEST")
+
+          start=$(jq -n \
+            --argjson manifest "$manifest_json" \
+            --arg sha256 "$sha256" \
+            --arg md5 "$md5" \
+            --argjson size "$size" \
+            '{manifest: $manifest, sha256: $sha256, md5: $md5, size: $size}' \
+            | curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $API_KEY" \
+                --header "Content-Type: application/json" \
+                --data @- "$SERVER/api/publish/start")
+
+          upload_url=$(jq -r '.uploadUrl' <<<"$start")
+          upload_token=$(jq -r '.uploadToken' <<<"$start")
+          content_md5=$(jq -r '.requiredHeaders["Content-MD5"]' <<<"$start")
+          echo "object key: $(jq -r '.objectKey' <<<"$start")"
+
+          # Content-MD5 is part of the signature, so R2 refuses a body that differs.
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "Content-MD5: $content_md5" \
+            --header "Content-Type: application/zip" \
+            --upload-file "$ZIP" \
+            "$upload_url"
+
+          complete=$(jq -n --arg token "$upload_token" '{uploadToken: $token}' \
+            | curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $API_KEY" \
+                --header "Content-Type: application/json" \
+                --data @- "$SERVER/api/publish/complete")
+          jq . <<<"$complete"
+
+          echo "plugin-id=$(jq -r '.plugin.id' <<<"$complete")" >> "$GITHUB_OUTPUT"
+          echo "assembly-version=$(jq -r '.version.assemblyVersion' <<<"$complete")" >> "$GITHUB_OUTPUT"
+
+      # Runs before the tag on purpose. Should it fail, re-running publishes the same version
+      # again (which replaces it) and retries this step, instead of finding nothing to release.
+      - name: Put the version on testing
+        if: steps.resolve.outputs.new_version != '' && inputs.testing
+        shell: bash
+        env:
+          API_KEY: ${{ secrets.PLUGIN_SERVER_API_KEY }}
+          PLUGIN_ID: ${{ steps.publish.outputs.plugin-id }}
+          ASSEMBLY_VERSION: ${{ steps.publish.outputs.assembly-version }}
+        run: |
+          set -euo pipefail
+          result=$(jq -n --arg version "$ASSEMBLY_VERSION" '{version: $version}' \
+            | curl --fail-with-body --silent --show-error \
+                --request PUT \
+                --header "Authorization: Bearer $API_KEY" \
+                --header "Content-Type: application/json" \
+                --data @- "$SERVER/api/plugins/$PLUGIN_ID/testing")
+          jq . <<<"$result"
+
+          jq -r '.updated[] | "testing \(.testing) -> \(.label) (stable \(.stable // "none"))"' <<<"$result"
+          jq -r '.skipped[] | "::warning::\(.label) was not changed: \(.reason)"' <<<"$result"
+          if [ "$(jq '.updated | length' <<<"$result")" -eq 0 ]; then
+            echo "::warning::no endpoint delivers $PLUGIN yet, so testing reached nobody. Subscribe an endpoint in the admin console."
+          fi
+
+      - name: Tag and release
+        if: steps.resolve.outputs.new_version != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.new_version }}
+          TAG: ${{ steps.resolve.outputs.new_tag }}
+          CHANGELOG: ${{ steps.resolve.outputs.changelog }}
+          ZIP: ${{ steps.artifact.outputs.zip }}
+        run: |
+          set -euo pipefail
+          cp "$ZIP" "$PLUGIN-$VERSION.zip"
+          printf '%s\n' "$CHANGELOG" > notes.md
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            "$PLUGIN-$VERSION.zip"
